@@ -11,4 +11,3 @@ uv.lock
 
 # JS dev tooling
 node_modules/
-package-lock.json
