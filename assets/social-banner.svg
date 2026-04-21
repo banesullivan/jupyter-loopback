@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" role="img" aria-label="jupyter-loopback — kernel-local servers, reachable from the notebook browser">
+  <title>jupyter-loopback</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0"  stop-color="#0b1220"/>
+      <stop offset="1"  stop-color="#121a2e"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0"   stop-color="#F37626" stop-opacity="0.20"/>
+      <stop offset="0.6" stop-color="#F37626" stop-opacity="0.04"/>
+      <stop offset="1"   stop-color="#F37626" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="dots" width="32" height="32" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="1" fill="#1f2a44"/>
+    </pattern>
+  </defs>
+
+  <!-- solid background -->
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <rect width="1280" height="640" fill="url(#dots)" opacity="0.6"/>
+  <!-- soft orange halo behind the mark -->
+  <ellipse cx="280" cy="320" rx="420" ry="300" fill="url(#glow)"/>
+
+  <!-- Mark: clean ellipse loop with flow arrows and two endpoint glyphs -->
+  <g transform="translate(120 160)">
+    <!-- the loop itself -->
+    <ellipse cx="160" cy="110" rx="140" ry="100"
+             fill="none" stroke="#F37626" stroke-width="7"/>
+
+    <!-- top arrow (east — flow out to browser) -->
+    <polygon fill="#F37626" points="145,-10 190,11 145,32"/>
+    <!-- bottom arrow (west — flow back to kernel) -->
+    <polygon fill="#F37626" points="175,188 130,209 175,230"/>
+
+    <!-- left endpoint: filled disc (kernel / 127.0.0.1) -->
+    <circle cx="72"  cy="110" r="22" fill="#F37626"/>
+    <!-- right endpoint: ring (browser) -->
+    <circle cx="248" cy="110" r="20" fill="none" stroke="#F37626" stroke-width="9"/>
+  </g>
+
+  <!-- Wordmark + supporting text -->
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif">
+    <text x="500" y="298" fill="#f3f4f6" font-size="84" font-weight="800" letter-spacing="-2">jupyter<tspan fill="#9ca3af" font-weight="500">-</tspan>loopback</text>
+    <text x="502" y="352" fill="#F37626" font-size="28" font-weight="600" letter-spacing="0.3">kernel-local servers, reachable from the browser</text>
+    <text x="502" y="402" fill="#9ca3af" font-size="20">
+      JupyterLab  ·  JupyterHub  ·  Binder  ·  VS Code  ·  Colab  ·  Shiny  ·  Solara  ·  marimo
+    </text>
+
+    <!-- code strip -->
+    <g transform="translate(502 452)">
+      <rect x="0" y="0" width="620" height="112" rx="12" fill="#0f172a" stroke="#1f2a44" stroke-width="1"/>
+      <text x="20" y="38" fill="#9ca3af" font-size="18"
+            font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace">
+        <tspan fill="#6b7280">&gt;&gt;&gt; </tspan>
+        <tspan fill="#f3f4f6">from</tspan>
+        <tspan fill="#9ca3af"> </tspan>
+        <tspan fill="#F37626">jupyter_loopback</tspan>
+        <tspan fill="#f3f4f6"> import</tspan>
+        <tspan fill="#F37626"> autodetect_prefix</tspan>
+      </text>
+      <text x="20" y="72" fill="#9ca3af" font-size="18"
+            font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace">
+        <tspan fill="#6b7280">&gt;&gt;&gt; </tspan>
+        <tspan fill="#f3f4f6">autodetect_prefix(</tspan>
+        <tspan fill="#86efac">"mylib"</tspan>
+        <tspan fill="#f3f4f6">)</tspan>
+      </text>
+      <text x="20" y="100" fill="#9ca3af" font-size="18"
+            font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace">
+        <tspan fill="#86efac">'/user/you/mylib-proxy/&#123;port&#125;'</tspan>
+      </text>
+    </g>
+  </g>
+</svg>

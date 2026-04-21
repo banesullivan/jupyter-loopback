@@ -1,0 +1,95 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools_scm[toml]>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jupyter-loopback"
+dynamic = ["version"]
+description = "Make kernel-local HTTP/WS servers reachable from the notebook browser with zero user config."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Bane Sullivan", email = "hello@banesullivan.com" }]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: Jupyter",
+  "Framework :: Jupyter :: JupyterLab",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: System :: Networking",
+  "Typing :: Typed",
+]
+dependencies = ["jupyter-server>=2", "tornado>=6.2"]
+
+[project.optional-dependencies]
+comm = ["anywidget>=0.9"]
+test = ["pytest", "pytest-asyncio", "anywidget>=0.9"]
+typecheck = ["mypy>=1.11"]
+dev = ["jupyter-loopback[comm,test,typecheck]", "pre-commit", "ruff"]
+
+[project.urls]
+"Source Code" = "https://github.com/banesullivan/jupyter-loopback"
+"Bug Tracker" = "https://github.com/banesullivan/jupyter-loopback/issues"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["jupyter_loopback*"]
+
+[tool.setuptools.package-data]
+"jupyter_loopback" = ["static/*.js", "static/*.css", "py.typed"]
+
+[tool.setuptools_scm]
+version_file = "jupyter_loopback/_version.py"
+version_scheme = "release-branch-semver"
+fallback_version = "0.0.0+unknown"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short --strict-markers"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["jupyter_loopback/_version.py"]
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "UP", "B", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/__init__.py" = ["F401", "F403"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+combine-as-imports = true
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_ignores = true
+# ``_version.py`` is setuptools-scm generated; its shape varies.
+exclude = "jupyter_loopback/_version.py"
+
+# These packages don't ship type stubs. Accepting ``Any`` for their
+# APIs is a conscious tradeoff until they publish stubs upstream.
+[[tool.mypy.overrides]]
+module = [
+  "anywidget",
+  "anywidget.*",
+  "traitlets",
+  "traitlets.*",
+  "IPython",
+  "IPython.*",
+  "jupyter_server",
+  "jupyter_server.*",
+  "tornado",
+  "tornado.*",
+]
+ignore_missing_imports = true

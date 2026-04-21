@@ -1,0 +1,7 @@
+{
+  "ServerApp": {
+    "jpserver_extensions": {
+      "loopback_demo._jupyter": true
+    }
+  }
+}

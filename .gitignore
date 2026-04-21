@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+jupyter_loopback/_version.py
+uv.lock
+
+# JS dev tooling
+node_modules/
+package-lock.json

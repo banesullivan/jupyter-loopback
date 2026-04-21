@@ -1,0 +1,14 @@
+{
+  "name": "jupyter-loopback-dev",
+  "private": true,
+  "description": "Dev tooling for the jupyter-loopback JS bundle (Biome + TypeScript checkJs).",
+  "scripts": {
+    "lint": "biome check jupyter_loopback/static",
+    "format": "biome format --write jupyter_loopback/static",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.2.4",
+    "typescript": "^5.6.3"
+  }
+}
