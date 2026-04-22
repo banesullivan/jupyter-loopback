@@ -77,7 +77,10 @@
  *     path: string,
  *     protocols?: string | string[],
  * ) => LoopbackWebSocket} openWebSocket
- * @property {(port: number | string) => void} interceptLocalhost
+ * @property {(
+ *     port: number | string,
+ *     pathPrefix?: string | null,
+ * ) => void} interceptLocalhost
  */
 
 /**
@@ -527,18 +530,51 @@ function ensureGlobal() {
 
     /** @type {Set<string>} */
     const interceptedPorts = new Set();
+    /**
+     * Path-prefix forwarders. Keyed by normalized prefix (no trailing
+     * slash); the value is the port the prefix routes to. Populated by
+     * ``interceptLocalhost(port, prefix)`` callers that want the comm
+     * bridge to cover for a registered HTTP proxy on deployments where
+     * the proxy extension isn't loaded server-side (e.g. JupyterHub
+     * with a kernel env that differs from the single-user server env).
+     *
+     * @type {Map<string, number>}
+     */
+    const prefixToPort = new Map();
+    /**
+     * Per-prefix probe outcome. Values:
+     *   "probing"  -- probe in flight; intercept now so early tiles
+     *                 don't 404 while we're waiting for the answer.
+     *   "working"  -- probe confirmed the HTTP proxy is mounted;
+     *                 don't intercept, let the fast Path A handle it.
+     *   "broken"   -- probe returned 404; comm bridge takes over.
+     *
+     * @type {Map<string, "probing" | "working" | "broken">}
+     */
+    const prefixStatus = new Map();
+    /**
+     * Original ``window.fetch`` captured before we patch it, so the
+     * probe can reach the jupyter-server without our own interceptor
+     * catching it and recursing through the comm bridge.
+     *
+     * @type {typeof fetch | null}
+     */
+    let origFetch = null;
     let interceptorInstalled = false;
 
     /**
      * Return true if ``url`` targets an intercepted 127.0.0.1 / localhost
-     * port. Non-string inputs and URLs missing a port are treated as no
-     * match so the interceptors leave them alone.
+     * port or a registered same-origin path prefix whose HTTP probe has
+     * not reported the proxy as working. Non-string inputs and URLs
+     * missing both a match shape are treated as no match so the
+     * interceptors leave them alone.
+     *
      * @param {unknown} url
      * @returns {{ port: number, pathAndQuery: string } | null}
      */
     function interceptMatch(url) {
         if (typeof url !== "string" || url.length === 0) return null;
-        if (url[0] === "/" || url[0] === "?") return null;
+        if (url[0] === "?") return null;
         /** @type {URL} */
         let parsed;
         try {
@@ -546,13 +582,110 @@ function ensureGlobal() {
         } catch (_) {
             return null;
         }
-        if (parsed.hostname !== "127.0.0.1" && parsed.hostname !== "localhost") return null;
-        if (!parsed.port) return null;
-        if (!interceptedPorts.has(parsed.port)) return null;
-        return {
-            port: Number(parsed.port),
-            pathAndQuery: parsed.pathname + parsed.search,
-        };
+        // 127.0.0.1 / localhost — the path for frontends that can't
+        // reach jupyter-server (VS Code webview, Colab, etc.) or for
+        // bare TileClient users who never wired up a proxy prefix.
+        if (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost") {
+            if (!parsed.port) return null;
+            if (!interceptedPorts.has(parsed.port)) return null;
+            return {
+                port: Number(parsed.port),
+                pathAndQuery: parsed.pathname + parsed.search,
+            };
+        }
+        // Same-origin prefix match — only relevant if the URL lives on
+        // the jupyter-server origin that served this page. Cross-origin
+        // URLs that happen to start with a registered prefix string are
+        // unrelated and must pass through.
+        if (prefixToPort.size === 0) return null;
+        if (parsed.origin !== window.location.origin) return null;
+        for (const [prefix, port] of prefixToPort) {
+            if (parsed.pathname !== prefix && !parsed.pathname.startsWith(`${prefix}/`)) {
+                continue;
+            }
+            const status = prefixStatus.get(prefix);
+            if (status === "working") return null;
+            // "probing" or "broken" (or unknown, e.g. probe errored
+            // before a fetch arrived) → route through comm. Rest is
+            // whatever the URL had after the prefix; preserve leading
+            // slash when present for the upstream request.
+            const rest = parsed.pathname.slice(prefix.length) + parsed.search;
+            return {
+                port,
+                pathAndQuery: rest || "/",
+            };
+        }
+        return null;
+    }
+
+    /**
+     * Probe ``<prefix>/__probe__`` on the jupyter-server origin to
+     * learn whether :func:`setup_proxy_handler` is mounted on the
+     * page's server. The probe endpoint answers ``204`` when the
+     * extension is loaded and ``404`` when it isn't, giving the
+     * interceptor a reliable signal without forwarding upstream.
+     *
+     * Runs once per prefix; cached status drives matching decisions in
+     * :func:`interceptMatch`. Uses :data:`origFetch` so the probe
+     * doesn't recurse back through the patched ``window.fetch``.
+     *
+     * @param {string} prefix normalized prefix (no trailing slash)
+     */
+    function probePrefix(prefix) {
+        if (prefixStatus.has(prefix)) return;
+        prefixStatus.set(prefix, "probing");
+        const fetcher = origFetch || (typeof fetch === "function" ? fetch : null);
+        if (!fetcher) {
+            // No fetch at all (exotic host): treat as broken so the
+            // comm bridge still has a shot via XHR / <img> interceptors.
+            prefixStatus.set(prefix, "broken");
+            return;
+        }
+        // ``__probe__`` is reserved by ``setup_proxy_handler`` and
+        // returns ``204`` when mounted. The trailing segment lets us
+        // distinguish "extension loaded" (non-404) from "no handler
+        // registered at all" (404 from the outer jupyter-server).
+        const probeUrl = `${prefix}/__probe__`;
+        const probe = fetcher(probeUrl, {
+            method: "HEAD",
+            credentials: "include",
+            cache: "no-store",
+        });
+        probe
+            .then((resp) => {
+                const status = resp.status === 404 ? "broken" : "working";
+                prefixStatus.set(prefix, status);
+                try {
+                    console.info(
+                        "[jupyter_loopback] probe",
+                        probeUrl,
+                        "->",
+                        resp.status,
+                        status === "broken"
+                            ? "(routing this prefix through comm bridge)"
+                            : "(HTTP proxy is live)",
+                    );
+                } catch (_) {
+                    /* console may be absent */
+                }
+            })
+            .catch((err) => {
+                // Network failures (CORS, offline, etc.) mean we can't
+                // reach the HTTP path at all; the comm bridge is the
+                // safer bet even if it turns out the extension was
+                // registered after all.
+                prefixStatus.set(prefix, "broken");
+                try {
+                    console.warn(
+                        "[jupyter_loopback] probe",
+                        probeUrl,
+                        "failed; falling back to comm bridge.",
+                        err,
+                    );
+                } catch (_) {
+                    /* console may be absent */
+                }
+            });
     }
 
     /**
@@ -605,7 +738,7 @@ function ensureGlobal() {
         }
 
         if (typeof window.fetch === "function") {
-            const origFetch = window.fetch.bind(window);
+            origFetch = window.fetch.bind(window);
             window.fetch = function patchedFetch(input, init) {
                 /** @type {string} */
                 let url;
@@ -616,10 +749,10 @@ function ensureGlobal() {
                 } else if (input && typeof input.url === "string") {
                     url = input.url;
                 } else {
-                    return origFetch(input, init);
+                    return /** @type {typeof fetch} */ (origFetch)(input, init);
                 }
                 const match = interceptMatch(url);
-                if (!match) return origFetch(input, init);
+                if (!match) return /** @type {typeof fetch} */ (origFetch)(input, init);
                 return loopbackFetch(match.port, match.pathAndQuery, init);
             };
         }
@@ -687,14 +820,35 @@ function ensureGlobal() {
      * Register a loopback port so its URLs get rerouted through the
      * comm bridge. Repeated calls for the same port are a no-op;
      * repeated calls with different ports accumulate.
+     *
+     * When ``pathPrefix`` is supplied (e.g.
+     * ``"/user/alice/mylib-proxy/41029"``), same-origin URLs starting
+     * with that prefix are also eligible for interception. The
+     * interceptor probes the prefix once against ``<prefix>/__probe__``
+     * and only actually routes through comm if the probe comes back
+     * ``404`` -- i.e. the server extension isn't loaded on the
+     * jupyter-server hosting this page. When the probe reports the
+     * proxy is live, the prefix is left alone and HTTP handles tiles
+     * directly.
+     *
      * @param {number | string} port
+     * @param {string | null | undefined} [pathPrefix]
      */
-    function interceptLocalhost(port) {
+    function interceptLocalhost(port, pathPrefix) {
         interceptedPorts.add(String(port));
+        /** @type {string | null} */
+        let normalizedPrefix = null;
+        if (typeof pathPrefix === "string" && pathPrefix.length > 0) {
+            normalizedPrefix = pathPrefix.replace(/\/+$/, "");
+            if (normalizedPrefix) {
+                prefixToPort.set(normalizedPrefix, Number(port));
+            }
+        }
         try {
             console.info(
                 "[jupyter_loopback] interceptLocalhost(",
                 port,
+                normalizedPrefix ? `, ${normalizedPrefix}` : "",
                 ") registered in",
                 location.href,
                 "first-install:",
@@ -707,6 +861,7 @@ function ensureGlobal() {
             installInterceptors();
             interceptorInstalled = true;
         }
+        if (normalizedPrefix) probePrefix(normalizedPrefix);
     }
 
     /** @type {LoopbackAPI} */
@@ -780,24 +935,41 @@ function render({ model }) {
     // This is the robust path for frontends where HTML <script> tags
     // don't run (VS Code's notebook renderer sometimes sanitizes them):
     // the widget JS always runs, so we install here from the synced
-    // ``intercepted_ports`` list. Changes propagate via the traitlets
-    // sync, so subsequent ``intercept_localhost`` calls also land.
+    // ``intercepted_ports`` / ``intercepted_prefixes`` state. Changes
+    // propagate via the traitlets sync, so subsequent
+    // ``intercept_localhost`` calls also land.
     function applyIntercepts() {
         /** @type {any} */
-        const raw = model.get("intercepted_ports");
-        if (!Array.isArray(raw)) return;
-        for (const p of raw) {
-            if (typeof p === "number" || typeof p === "string") {
-                api.interceptLocalhost(p);
+        const rawPorts = model.get("intercepted_ports");
+        /** @type {any} */
+        const rawPrefixes = model.get("intercepted_prefixes");
+        /** @type {Record<string, string>} */
+        const prefixes = rawPrefixes && typeof rawPrefixes === "object" ? rawPrefixes : {};
+        if (Array.isArray(rawPorts)) {
+            for (const p of rawPorts) {
+                if (typeof p !== "number" && typeof p !== "string") continue;
+                const key = String(p);
+                const prefix = prefixes[key];
+                api.interceptLocalhost(p, typeof prefix === "string" ? prefix : null);
             }
+        }
+        // Handle prefixes that arrived before (or without) a
+        // corresponding port entry, e.g. a pure ``add_intercepted_prefix``
+        // call (unlikely but possible if a library uses the bridge
+        // directly).
+        for (const [key, prefix] of Object.entries(prefixes)) {
+            if (typeof prefix !== "string") continue;
+            api.interceptLocalhost(Number(key), prefix);
         }
     }
     applyIntercepts();
     model.on("change:intercepted_ports", applyIntercepts);
+    model.on("change:intercepted_prefixes", applyIntercepts);
 
     return () => {
         model.off("msg:custom", onMsg);
         model.off("change:intercepted_ports", applyIntercepts);
+        model.off("change:intercepted_prefixes", applyIntercepts);
         bridge.alive = () => false;
         api.removeBridge(bridge);
     };

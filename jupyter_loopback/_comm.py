@@ -25,6 +25,7 @@ Responses echo the ``id`` and carry either
 
 from collections.abc import Callable
 import concurrent.futures
+import json
 import logging
 import pathlib
 import threading
@@ -215,6 +216,19 @@ else:
         # where HTML ``<script>`` tags are sanitized (VS Code Jupyter).
         intercepted_ports = traitlets.List(traitlets.Int()).tag(sync=True)
 
+        # Root-relative URL path prefixes the browser should reroute
+        # through this bridge when the HTTP proxy at that prefix is
+        # unreachable. Keyed by ``str(port)`` because traitlets ``Dict``
+        # coerces JSON object keys to strings at serialization. Each
+        # value is the absolute path prefix with ``{port}`` already
+        # substituted (e.g. ``"/user/alice/mylib-proxy/41029"``). The
+        # JS half probes each prefix once and only intercepts when the
+        # probe confirms the HTTP path is absent.
+        intercepted_prefixes = traitlets.Dict(
+            value_trait=traitlets.Unicode(),
+            key_trait=traitlets.Unicode(),
+        ).tag(sync=True)
+
         def __init__(self, **kwargs: Any) -> None:
             super().__init__(**kwargs)
             self.on_msg(self._on_msg)
@@ -229,6 +243,36 @@ else:
             # Traitlets only fires ``change`` on identity change for
             # List; mutate via new-list assignment.
             self.intercepted_ports = [*self.intercepted_ports, port_int]
+
+        def add_intercepted_prefix(self, port: int, prefix: str) -> None:
+            """
+            Register a root-relative URL prefix as a fallback target for a port.
+
+            The browser-side interceptor probes the prefix once to see
+            whether the HTTP proxy handler is actually mounted on the
+            jupyter-server serving the current page. If the probe
+            returns 404, subsequent requests to that prefix are routed
+            through the comm bridge instead. Idempotent.
+
+            Parameters
+            ----------
+            port : int
+                The loopback port the prefix forwards to.
+            prefix : str
+                The absolute URL path (e.g.
+                ``"/user/alice/mylib-proxy/41029"``) with ``{port}``
+                already substituted. Trailing slashes are stripped
+                for consistent matching.
+            """
+            key = str(int(port))
+            normalized = prefix.rstrip("/")
+            if not normalized:
+                return
+            if self.intercepted_prefixes.get(key) == normalized:
+                return
+            # Dict trait sync fires on identity change, same pattern
+            # as ``intercepted_ports`` above.
+            self.intercepted_prefixes = {**self.intercepted_prefixes, key: normalized}
 
         def _on_msg(
             self,
@@ -314,7 +358,12 @@ def enable_comm_bridge(*, display: bool = True) -> "CommBridge":
     return bridge
 
 
-def intercept_localhost(port: int, *, display: bool = True) -> Any:
+def intercept_localhost(
+    port: int,
+    *,
+    path_prefix: str | None = None,
+    display: bool = True,
+) -> Any:
     """
     Route ``http://127.0.0.1:<port>/*`` URLs through the comm bridge.
 
@@ -340,6 +389,18 @@ def intercept_localhost(port: int, *, display: bool = True) -> Any:
     ----------
     port : int
         The loopback port whose URLs should be intercepted.
+    path_prefix : str or None, keyword-only, optional
+        Absolute URL path prefix (with ``{port}`` already substituted,
+        e.g. ``"/user/alice/mylib-proxy/41029"``) that also forwards to
+        this loopback port via the :func:`setup_proxy_handler` HTTP
+        route. When supplied, the browser-side interceptor probes the
+        prefix once; if the probe comes back ``404`` -- the single-user
+        server doesn't have the extension installed, which is the usual
+        case on JupyterHub deployments where the kernel env and server
+        env diverge -- subsequent requests to that prefix are routed
+        through the comm bridge instead. If the probe succeeds the
+        prefix is left alone so the faster HTTP path keeps serving
+        tiles.
     display : bool, keyword-only, optional
         If ``True`` (default), ``IPython.display.display`` the HTML
         snippet so the shim installs immediately in the current
@@ -379,16 +440,20 @@ def intercept_localhost(port: int, *, display: bool = True) -> Any:
         raise ImportError(msg) from exc
 
     port_int = int(port)
+    prefix_clean = (path_prefix or "").rstrip("/") or None
 
     # Primary install path: update the bridge's synced ``intercepted_ports``
-    # trait so every rendered widget view (regardless of iframe) receives
-    # the change and calls ``interceptLocalhost`` in its own
-    # ``HTMLImageElement.prototype`` context. This survives VS Code's
-    # <script>-tag sanitization in HTML outputs.
+    # (and ``intercepted_prefixes``) traits so every rendered widget
+    # view (regardless of iframe) receives the change and calls
+    # ``interceptLocalhost`` in its own ``HTMLImageElement.prototype``
+    # context. This survives VS Code's <script>-tag sanitization in
+    # HTML outputs.
     trait_handled = False
     if _BRIDGE is not None:
         try:
             _BRIDGE.add_intercepted_port(port_int)  # type: ignore[attr-defined]
+            if prefix_clean:
+                _BRIDGE.add_intercepted_prefix(port_int, prefix_clean)  # type: ignore[attr-defined]
             trait_handled = True
         except Exception:
             # Best-effort: if the trait update fails (e.g. stale bridge
@@ -404,13 +469,18 @@ def intercept_localhost(port: int, *, display: bool = True) -> Any:
     # in custom HTML outputs; only auto-displayed when the trait path
     # isn't available, otherwise we'd emit a redundant <script> output
     # per call and clutter notebooks that construct many tile layers.
+    #
+    # ``q`` is a JSON-encoded string (or ``null``); embedding via
+    # ``json.dumps`` keeps quoting correct for arbitrary prefixes.
+    prefix_js = json.dumps(prefix_clean) if prefix_clean else "null"
     script = (
         "<script>(function(){"
         f"var p={port_int};"
+        f"var q={prefix_js};"
         "function g(){return window.__jupyter_loopback__;}"
         "function go(){"
         "var a=g();"
-        "if(a&&a.interceptLocalhost){a.interceptLocalhost(p);return true}"
+        "if(a&&a.interceptLocalhost){a.interceptLocalhost(p,q);return true}"
         "return false}"
         "if(!go()){"
         "var n=0;"

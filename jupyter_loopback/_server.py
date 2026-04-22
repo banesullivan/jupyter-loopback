@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from tornado.web import Application
     from tornado.websocket import WebSocketClientConnection
 
-__all__ = ["LoopbackProxyHandler", "setup_proxy_handler"]
+__all__ = ["LoopbackProbeHandler", "LoopbackProxyHandler", "setup_proxy_handler"]
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +330,45 @@ def _log_write_errors(future: asyncio.Future[Any]) -> None:
         logger.debug("jupyter_loopback WS write failed: %s", exc)
 
 
+class LoopbackProbeHandler(web.RequestHandler):
+    """
+    Namespace liveness probe.
+
+    Browser-side code hits ``<base_url>/<namespace>-proxy/__probe__`` to
+    learn whether :func:`setup_proxy_handler` has registered the
+    HTTP/WS proxy on the jupyter-server hosting the current page. A
+    ``200`` (or any non-``404``) response means the extension is
+    loaded and Path A tile fetches will work; a ``404`` means the
+    extension is absent and the comm bridge should take over.
+
+    Handled at jupyter-server level, not forwarded upstream, so it
+    answers reliably even when the kernel's loopback service is still
+    starting up. Unauthenticated on purpose: it returns no content and
+    its only signal -- ``I am the jupyter-loopback proxy for this
+    namespace'' -- is already inferable from the URL the caller
+    constructed.
+    """
+
+    namespace: ClassVar[str] = ""
+
+    def set_default_headers(self) -> None:
+        """Keep probe responses unambiguous across origins and caches."""
+        self.set_header("Cache-Control", "no-store")
+        self.set_header("Access-Control-Allow-Origin", "*")
+        self.set_header("X-Jupyter-Loopback-Namespace", self.namespace)
+
+    def get(self) -> None:
+        """Report registration with an empty 204."""
+        self.set_status(204)
+
+    def head(self) -> None:
+        """Same signal as GET, but cheaper when the probe just needs status."""
+        self.set_status(204)
+
+    def check_xsrf_cookie(self) -> None:
+        """Probe endpoint is read-only and unauthenticated by design."""
+
+
 def setup_proxy_handler(
     web_app: "Application",
     namespace: str,
@@ -340,7 +379,13 @@ def setup_proxy_handler(
     Mount a loopback proxy handler for ``namespace`` on ``web_app``.
 
     Produces a namespace-specific subclass of ``handler_cls`` and
-    registers it at ``<base_url>/<namespace>-proxy/<port>/...``.
+    registers it at ``<base_url>/<namespace>-proxy/<port>/...``. Also
+    mounts a small :class:`LoopbackProbeHandler` at
+    ``<base_url>/<namespace>-proxy/__probe__`` that browser-side code
+    can use to detect whether the extension is loaded on the server
+    serving the current page (so the comm bridge can pick up the slack
+    on deployments where the single-user env doesn't have this
+    extension installed).
 
     Parameters
     ----------
@@ -390,10 +435,21 @@ def setup_proxy_handler(
     route = url_path_join(web_app.settings["base_url"], pattern)
     re.compile(route)  # surface typos eagerly
 
+    probe_pattern = rf"{re.escape(namespace)}-proxy/__probe__"
+    probe_route = url_path_join(web_app.settings["base_url"], probe_pattern)
+
     cls = type(
         f"{namespace.title().replace('-', '')}LoopbackProxyHandler",
         (handler_cls,),
         {"namespace": namespace},
     )
-    web_app.add_handlers(".*$", [(route, cls)])
+    probe_cls = type(
+        f"{namespace.title().replace('-', '')}LoopbackProbeHandler",
+        (LoopbackProbeHandler,),
+        {"namespace": namespace},
+    )
+    # Order matters: the probe route is more specific than the main
+    # route's ``\d+`` port capture, but Tornado evaluates in order, so
+    # register it first to shave one regex step off the common case.
+    web_app.add_handlers(".*$", [(probe_route, probe_cls), (route, cls)])
     return cls

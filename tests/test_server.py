@@ -78,8 +78,12 @@ def test_namespaces_are_isolated() -> None:
     setup_proxy_handler(app, namespace="a")
     setup_proxy_handler(app, namespace="b")
     patterns = _mounted_patterns(app)
-    assert sum("a-proxy" in p for p in patterns) == 1
-    assert sum("b-proxy" in p for p in patterns) == 1
+    # Each namespace mounts one main proxy route plus one probe route
+    # (``<namespace>-proxy/__probe__``), so both strings appear twice.
+    assert sum("a-proxy" in p for p in patterns) == 2
+    assert sum("b-proxy" in p for p in patterns) == 2
+    assert sum("a-proxy/__probe__" in p for p in patterns) == 1
+    assert sum("b-proxy/__probe__" in p for p in patterns) == 1
 
 
 def test_setup_proxy_handler_duplicate_namespace_raises() -> None:
@@ -446,6 +450,87 @@ def _run_echo_in_subprocess(port: int, ready_port: int) -> None:
     except OSError:
         pass
     server.serve_forever()
+
+
+# ---------------------------------------------------------------------------
+# Namespace probe — lets browser-side code detect whether the proxy
+# extension is loaded on the single-user server without forwarding
+# upstream.
+# ---------------------------------------------------------------------------
+
+
+async def test_probe_endpoint_returns_204_when_registered() -> None:
+    """
+    ``<base>/<namespace>-proxy/__probe__`` responds 204 when the
+    extension is mounted. The comm bridge uses this signal to decide
+    whether to route through HTTP (fast) or the comm bridge fallback.
+    """
+    async with _ProxyServer(namespace="mylib") as proxy:
+        client = AsyncHTTPClient()
+        resp = await client.fetch(
+            f"http://127.0.0.1:{proxy.port}/mylib-proxy/__probe__",
+            method="HEAD",
+            raise_error=False,
+        )
+    assert resp.code == 204
+    assert resp.headers.get("X-Jupyter-Loopback-Namespace") == "mylib"
+    assert resp.headers.get("Access-Control-Allow-Origin") == "*"
+
+
+async def test_probe_endpoint_isolated_per_namespace() -> None:
+    """
+    Two namespaces on the same app don't bleed probe responses into
+    each other; the ``X-Jupyter-Loopback-Namespace`` header is how
+    debugging tells them apart.
+    """
+    app = Application([], **_COMMON_JUPYTER_SETTINGS)
+    setup_proxy_handler(app, namespace="a", handler_cls=_NoAuthProxyHandler)
+    setup_proxy_handler(app, namespace="b", handler_cls=_NoAuthProxyHandler)
+    sock, port = bind_unused_port()
+    server = HTTPServer(app)
+    server.add_sockets([sock])
+    try:
+        client = AsyncHTTPClient()
+        resp_a = await client.fetch(
+            f"http://127.0.0.1:{port}/a-proxy/__probe__",
+            raise_error=False,
+        )
+        resp_b = await client.fetch(
+            f"http://127.0.0.1:{port}/b-proxy/__probe__",
+            raise_error=False,
+        )
+    finally:
+        server.stop()
+        await server.close_all_connections()
+        sock.close()
+    assert resp_a.code == 204
+    assert resp_a.headers.get("X-Jupyter-Loopback-Namespace") == "a"
+    assert resp_b.code == 204
+    assert resp_b.headers.get("X-Jupyter-Loopback-Namespace") == "b"
+
+
+async def test_probe_endpoint_404_when_namespace_not_registered() -> None:
+    """
+    Probing a namespace that was never mounted returns 404 (jupyter-server
+    has no handler for that route). This is the signal the browser-side
+    interceptor uses to fall back to the comm bridge.
+    """
+    app = Application([], **_COMMON_JUPYTER_SETTINGS)
+    setup_proxy_handler(app, namespace="mounted", handler_cls=_NoAuthProxyHandler)
+    sock, port = bind_unused_port()
+    server = HTTPServer(app)
+    server.add_sockets([sock])
+    try:
+        client = AsyncHTTPClient()
+        resp = await client.fetch(
+            f"http://127.0.0.1:{port}/unmounted-proxy/__probe__",
+            raise_error=False,
+        )
+    finally:
+        server.stop()
+        await server.close_all_connections()
+        sock.close()
+    assert resp.code == 404
 
 
 async def test_http_proxy_works_across_process_boundary() -> None:

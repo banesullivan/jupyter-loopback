@@ -263,3 +263,102 @@ def test_intercept_localhost_displays_script_when_bridge_absent() -> None:
     assert len(captured) == 1
     body = getattr(captured[0], "data", "")
     assert "6666" in body
+
+
+def test_intercept_localhost_path_prefix_is_keyword_only() -> None:
+    """Positional ``path_prefix`` is rejected so the shape can't drift."""
+    with pytest.raises(TypeError):
+        intercept_localhost(4242, "/user/alice/mylib-proxy/4242")  # type: ignore[misc]
+
+
+def test_intercept_localhost_stores_prefix_on_bridge_trait() -> None:
+    """
+    ``path_prefix`` flows through ``CommBridge.intercepted_prefixes``
+    so every rendered widget view (even in a separate iframe) learns
+    which same-origin paths to probe.
+    """
+    bridge = enable_comm_bridge(display=False)
+    intercept_localhost(
+        41029,
+        path_prefix="/user/alice/mylib-proxy/41029",
+        display=False,
+    )
+    assert 41029 in bridge.intercepted_ports
+    assert bridge.intercepted_prefixes["41029"] == "/user/alice/mylib-proxy/41029"
+
+
+def test_intercept_localhost_strips_trailing_slashes_on_prefix() -> None:
+    """
+    Normalized storage lets the JS side compare paths without worrying
+    about caller-supplied trailing slashes (``/...-proxy/41029`` vs
+    ``/...-proxy/41029/``).
+    """
+    bridge = enable_comm_bridge(display=False)
+    intercept_localhost(
+        3030,
+        path_prefix="/user/alice/mylib-proxy/3030///",
+        display=False,
+    )
+    assert bridge.intercepted_prefixes["3030"] == "/user/alice/mylib-proxy/3030"
+
+
+def test_intercept_localhost_script_embeds_prefix_for_bridgeless_install() -> None:
+    """
+    When the bridge isn't live yet, the fallback ``<script>`` still
+    carries the prefix (as a JSON literal) so it reaches the global
+    ``interceptLocalhost`` API once the widget boots.
+    """
+    html = intercept_localhost(
+        2020,
+        path_prefix="/srv/proxy/2020",
+        display=False,
+    )
+    body = html.data
+    assert "2020" in body
+    # JSON encoding keeps quoting correct for arbitrary prefixes
+    # (paths with quotes, unicode, etc.).
+    assert '"/srv/proxy/2020"' in body
+
+
+def test_intercept_localhost_without_prefix_passes_null() -> None:
+    """
+    Omitting ``path_prefix`` must not leak an empty string into the
+    fallback shim; it has to be ``null`` so JS treats it as "no prefix".
+    """
+    html = intercept_localhost(1010, display=False)
+    body = html.data
+    assert "1010" in body
+    assert "q=null" in body
+
+
+def test_add_intercepted_prefix_is_idempotent() -> None:
+    """Duplicate registration doesn't churn the synced dict."""
+    bridge = CommBridge()
+    bridge.add_intercepted_prefix(9001, "/srv/proxy/9001")
+    first = bridge.intercepted_prefixes
+    bridge.add_intercepted_prefix(9001, "/srv/proxy/9001")
+    assert bridge.intercepted_prefixes is first
+
+
+def test_widget_js_wires_prefix_interception_and_probe() -> None:
+    """
+    Regression guard: the bundled JS must carry both the prefix match
+    logic and the probe call. Losing either turns the JupyterHub
+    fallback back into a silent 404.
+    """
+    contents = Path(comm_module._WIDGET_ESM).read_text()
+    assert "prefixToPort" in contents
+    assert "prefixStatus" in contents
+    assert "__probe__" in contents
+    assert "probePrefix" in contents
+
+
+def test_widget_js_binds_intercepted_prefixes_trait() -> None:
+    """
+    The widget reads ``intercepted_prefixes`` at render and listens
+    for trait changes, so late ``intercept_localhost`` calls still
+    land in re-rendered views.
+    """
+    contents = Path(comm_module._WIDGET_ESM).read_text()
+    assert "intercepted_prefixes" in contents
+    assert "change:intercepted_prefixes" in contents
