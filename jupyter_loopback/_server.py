@@ -334,12 +334,21 @@ class LoopbackProbeHandler(web.RequestHandler):
     """
     Namespace liveness probe.
 
-    Browser-side code hits ``<base_url>/<namespace>-proxy/__probe__`` to
-    learn whether :func:`setup_proxy_handler` has registered the
+    Browser-side code hits ``<base_url>/<namespace>-proxy/__probe__``
+    (or, equivalently, ``<base_url>/<namespace>-proxy/<port>/__probe__``)
+    to learn whether :func:`setup_proxy_handler` has registered the
     HTTP/WS proxy on the jupyter-server hosting the current page. A
     ``200`` (or any non-``404``) response means the extension is
     loaded and Path A tile fetches will work; a ``404`` means the
     extension is absent and the comm bridge should take over.
+
+    Both shapes answer 204: the per-port shape matters because the
+    JS interceptor probes ``<prefix>/__probe__`` and ``<prefix>``
+    already has ``{port}`` substituted in. Without matching the
+    per-port shape, the probe falls through to :class:`LoopbackProxyHandler`,
+    gets forwarded to the loopback app, and the app's 404 for an
+    unknown ``/__probe__`` route lies to the JS about extension
+    availability.
 
     Handled at jupyter-server level, not forwarded upstream, so it
     answers reliably even when the kernel's loopback service is still
@@ -381,11 +390,13 @@ def setup_proxy_handler(
     Produces a namespace-specific subclass of ``handler_cls`` and
     registers it at ``<base_url>/<namespace>-proxy/<port>/...``. Also
     mounts a small :class:`LoopbackProbeHandler` at
-    ``<base_url>/<namespace>-proxy/__probe__`` that browser-side code
-    can use to detect whether the extension is loaded on the server
-    serving the current page (so the comm bridge can pick up the slack
-    on deployments where the single-user env doesn't have this
-    extension installed).
+    ``<base_url>/<namespace>-proxy/__probe__`` and at
+    ``<base_url>/<namespace>-proxy/<port>/__probe__`` (both shapes
+    answer 204) so browser-side code can detect whether the extension
+    is loaded on the server serving the current page -- no matter which
+    shape it happens to construct -- and the comm bridge can pick up
+    the slack on deployments where the single-user env doesn't have
+    this extension installed.
 
     Parameters
     ----------
@@ -435,7 +446,14 @@ def setup_proxy_handler(
     route = url_path_join(web_app.settings["base_url"], pattern)
     re.compile(route)  # surface typos eagerly
 
-    probe_pattern = rf"{re.escape(namespace)}-proxy/__probe__"
+    # Matches both ``<namespace>-proxy/__probe__`` (the pure-namespace
+    # shape, useful for callers that probe before they know a port) and
+    # ``<namespace>-proxy/<port>/__probe__`` (what the JS interceptor
+    # actually constructs, because ``interceptLocalhost`` receives a
+    # prefix with ``{port}`` already substituted in). Registering both
+    # keeps the probe answering 204 in either case instead of leaking
+    # through to the upstream app's own 404.
+    probe_pattern = rf"{re.escape(namespace)}-proxy(?:/\d+)?/__probe__"
     probe_route = url_path_join(web_app.settings["base_url"], probe_pattern)
 
     cls = type(

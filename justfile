@@ -11,24 +11,24 @@ port         := env("PORT", "8888")
 default:
     @just --list
 
-# Install dev dependencies and pre-commit hooks
-install:
-    pip install -e ".[dev]"
-    pre-commit install
+# Sync dev dependencies and install pre-commit hooks
+sync:
+    uv sync --all-extras
+    uv run pre-commit install
 
 # Run all pre-commit hooks (Python) and biome check (JS); both always run
 lint:
     #!/usr/bin/env bash
     set -uo pipefail
     rc=0
-    pre-commit run --all-files || rc=$?
+    uv run pre-commit run --all-files || rc=$?
     npx --yes -p @biomejs/biome@2.2.4 biome check jupyter_loopback/static || rc=$?
     exit $rc
 
 # Auto-format Python (pre-commit also formats on commit)
 format:
-    ruff format jupyter_loopback tests demos
-    ruff check --fix jupyter_loopback tests demos
+    uv run ruff format jupyter_loopback tests demos
+    uv run ruff check --fix jupyter_loopback tests demos
 
 # Strict mypy (Python) and tsc --noEmit (JS); both always run.
 # ``uv run`` pins mypy to the locked version from the project venv so
@@ -52,15 +52,15 @@ lint-js:
 
 # Run tests
 test:
-    pytest
+    uv run pytest
 
 # Run tests with coverage (requires pytest-cov)
 coverage:
-    pytest --cov=jupyter_loopback --cov-report=term-missing
+    uv run pytest --cov=jupyter_loopback --cov-report=term-missing
 
 # Build sdist + wheel into ./dist
 build:
-    python -m build
+    uv build
 
 # --- Docker demo ---
 

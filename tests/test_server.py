@@ -78,12 +78,12 @@ def test_namespaces_are_isolated() -> None:
     setup_proxy_handler(app, namespace="a")
     setup_proxy_handler(app, namespace="b")
     patterns = _mounted_patterns(app)
-    # Each namespace mounts one main proxy route plus one probe route
-    # (``<namespace>-proxy/__probe__``), so both strings appear twice.
+    # Each namespace mounts one main proxy route plus one probe route,
+    # so both namespace strings appear twice.
     assert sum("a-proxy" in p for p in patterns) == 2
     assert sum("b-proxy" in p for p in patterns) == 2
-    assert sum("a-proxy/__probe__" in p for p in patterns) == 1
-    assert sum("b-proxy/__probe__" in p for p in patterns) == 1
+    assert sum("__probe__" in p and "a-proxy" in p for p in patterns) == 1
+    assert sum("__probe__" in p and "b-proxy" in p for p in patterns) == 1
 
 
 def test_setup_proxy_handler_duplicate_namespace_raises() -> None:
@@ -507,6 +507,58 @@ async def test_probe_endpoint_isolated_per_namespace() -> None:
     assert resp_a.headers.get("X-Jupyter-Loopback-Namespace") == "a"
     assert resp_b.code == 204
     assert resp_b.headers.get("X-Jupyter-Loopback-Namespace") == "b"
+
+
+async def test_probe_endpoint_matches_per_port_shape() -> None:
+    """
+    Regression guard for JupyterHub/mybinder: the JS interceptor builds
+    the probe URL as ``<prefix>/__probe__`` with ``{port}`` already
+    substituted in, i.e. ``<base>/<namespace>-proxy/<port>/__probe__``.
+    That shape must answer 204 too -- otherwise it falls through to the
+    main proxy handler, gets forwarded to the loopback app, and the
+    app's 404 for an unknown ``/__probe__`` route lies to the JS about
+    extension availability and wrongly triggers the comm-bridge
+    fallback on deployments where the HTTP proxy is actually live.
+    """
+    async with _ProxyServer(namespace="mylib") as proxy:
+        client = AsyncHTTPClient()
+        resp = await client.fetch(
+            f"http://127.0.0.1:{proxy.port}/mylib-proxy/44367/__probe__",
+            method="HEAD",
+            raise_error=False,
+        )
+    assert resp.code == 204
+    assert resp.headers.get("X-Jupyter-Loopback-Namespace") == "mylib"
+
+
+async def test_probe_endpoint_does_not_swallow_real_tile_requests() -> None:
+    """
+    The broadened probe regex must still let real per-port URLs reach
+    the proxy handler. Only paths that end in ``/__probe__`` should be
+    captured by the probe route; anything else (``/tiles/…``, etc.)
+    flows to :class:`LoopbackProxyHandler` as before.
+    """
+    app = Application([], **_COMMON_JUPYTER_SETTINGS)
+    setup_proxy_handler(app, namespace="mylib", handler_cls=_NoAuthProxyHandler)
+    sock, port = bind_unused_port()
+    server = HTTPServer(app)
+    server.add_sockets([sock])
+    try:
+        client = AsyncHTTPClient()
+        # Port 1 is unbound on the loopback; the proxy attempt produces
+        # a 502/504, not a probe 204. That tells us the main handler
+        # took over for this non-probe path even though the URL shape
+        # is port-shaped.
+        resp = await client.fetch(
+            f"http://127.0.0.1:{port}/mylib-proxy/1/tiles/0/0/0.png",
+            method="HEAD",
+            raise_error=False,
+        )
+    finally:
+        server.stop()
+        await server.close_all_connections()
+        sock.close()
+    assert resp.code != 204
 
 
 async def test_probe_endpoint_404_when_namespace_not_registered() -> None:
