@@ -117,16 +117,27 @@ async function bodyToBuffer(init) {
     if (!init || init.body == null) return null;
     const b = init.body;
     if (b instanceof ArrayBuffer) return b;
-    if (ArrayBuffer.isView(b)) return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+    if (ArrayBuffer.isView(b)) {
+        // ``ArrayBufferView.buffer`` is typed ``ArrayBuffer |
+        // SharedArrayBuffer`` in newer lib.dom; we only traffic in
+        // regular ``ArrayBuffer`` over the comm protocol so the cast
+        // is safe. SharedArrayBuffer bodies would fail at structured-
+        // clone time anyway.
+        return /** @type {ArrayBuffer} */ (
+            b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength)
+        );
+    }
     if (typeof Blob !== "undefined" && b instanceof Blob) return await b.arrayBuffer();
-    if (typeof b === "string") return new TextEncoder().encode(b).buffer;
+    if (typeof b === "string") {
+        return /** @type {ArrayBuffer} */ (new TextEncoder().encode(b).buffer);
+    }
     if (typeof FormData !== "undefined" && b instanceof FormData) {
         // Serialize as multipart by hand? Out of scope for loopback;
         // library authors wanting multipart should pre-serialize.
         throw new Error("jupyter_loopback.fetch: FormData bodies unsupported");
     }
     if (typeof URLSearchParams !== "undefined" && b instanceof URLSearchParams) {
-        return new TextEncoder().encode(b.toString()).buffer;
+        return /** @type {ArrayBuffer} */ (new TextEncoder().encode(b.toString()).buffer);
     }
     throw new Error("jupyter_loopback.fetch: unsupported body type");
 }
@@ -410,8 +421,14 @@ function ensureGlobal() {
                     buffers = [data];
                 } else if (ArrayBuffer.isView(data)) {
                     const view = /** @type {ArrayBufferView} */ (data);
+                    // Cast the slice: ``view.buffer`` is typed
+                    // ``ArrayBuffer | SharedArrayBuffer`` in newer
+                    // lib.dom; only regular ``ArrayBuffer`` survives
+                    // the comm protocol's structured clone anyway.
                     buffers = [
-                        view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength),
+                        /** @type {ArrayBuffer} */ (
+                            view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength)
+                        ),
                     ];
                 } else {
                     throw new Error("jupyter_loopback.WebSocket.send: unsupported data type");
