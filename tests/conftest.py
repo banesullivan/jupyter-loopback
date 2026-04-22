@@ -23,6 +23,17 @@ def _reset_comm_state() -> None:
     _comm._HANDLERS.clear()
     _comm._BRIDGE = None
     _comm._ENABLED = False
+    try:
+        from jupyter_loopback import _bridge_proxy
+    except ImportError:  # pragma: no cover — tornado missing, unlikely
+        return
+    with _bridge_proxy._WS_LOCK:
+        for conn in list(_bridge_proxy._WS_CONNS.values()):
+            try:
+                conn.close()
+            except Exception:  # pragma: no cover — best-effort teardown
+                pass
+        _bridge_proxy._WS_CONNS.clear()
 
 
 @pytest.fixture(autouse=True)

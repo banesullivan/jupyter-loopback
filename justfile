@@ -30,12 +30,15 @@ format:
     ruff format jupyter_loopback tests demos
     ruff check --fix jupyter_loopback tests demos
 
-# Strict mypy (Python) and tsc --noEmit (JS); both always run
+# Strict mypy (Python) and tsc --noEmit (JS); both always run.
+# ``uv run`` pins mypy to the locked version from the project venv so
+# typecheck results are reproducible regardless of whatever raw
+# ``mypy`` happens to be first on PATH.
 typecheck:
     #!/usr/bin/env bash
     set -uo pipefail
     rc=0
-    mypy jupyter_loopback || rc=$?
+    uv run mypy jupyter_loopback || rc=$?
     npx --yes -p typescript@5.6.3 tsc --noEmit -p tsconfig.json || rc=$?
     exit $rc
 

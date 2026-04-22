@@ -14,6 +14,7 @@ from jupyter_loopback import (
     CommBridge,
     _comm as comm_module,
     enable_comm_bridge,
+    intercept_localhost,
     is_comm_bridge_enabled,
     off_request,
     on_request,
@@ -182,3 +183,83 @@ def test_widget_static_assets_exist() -> None:
     assert "export default" in contents
     assert "__jupyter_loopback__" in contents
     assert "request" in contents
+
+
+def test_widget_js_exposes_intercept_localhost() -> None:
+    """The DOM interceptor is wired into the global JS API."""
+    contents = Path(comm_module._WIDGET_ESM).read_text()
+    assert "interceptLocalhost" in contents
+    assert "HTMLImageElement" in contents
+
+
+def test_widget_js_gates_dispatch_on_active_bridge() -> None:
+    """
+    Every rendered widget view subscribes to the comm's ``msg:custom``,
+    so kernel ``self.send`` calls fan out to N views when the widget is
+    displayed N times. The frontend must dispatch at most once per send
+    (otherwise WS event listeners fire twice, fetch responses resolve
+    twice, etc.). The guard lives in the ``onMsg`` inside ``render`` and
+    uses ``_isActiveBridge``; guarantee the bundle keeps it.
+    """
+    contents = Path(comm_module._WIDGET_ESM).read_text()
+    assert "_isActiveBridge" in contents
+    # Sanity: the guard is actually used in the render message callback,
+    # not just exposed on the api surface.
+    assert "if (!api._isActiveBridge(bridge))" in contents
+
+
+def test_intercept_localhost_returns_html_with_port() -> None:
+    html = intercept_localhost(35049, display=False)
+    # The IPython.display.HTML object exposes its raw body via .data.
+    assert "interceptLocalhost" in html.data
+    assert "35049" in html.data
+
+
+def test_intercept_localhost_coerces_port_to_int() -> None:
+    """
+    The port is stringified into the generated JS via ``int()``, so
+    strings and floats are accepted but non-numeric input raises.
+    """
+    html = intercept_localhost(8000, display=False)
+    assert "8000" in html.data
+    with pytest.raises((ValueError, TypeError)):
+        intercept_localhost("not-a-port", display=False)  # type: ignore[arg-type]
+
+
+def test_intercept_localhost_updates_bridge_trait_when_enabled() -> None:
+    """
+    When the bridge singleton is live, ``intercept_localhost`` pushes
+    the port onto the synced ``intercepted_ports`` list so every
+    rendered view can install the interceptor in its own iframe.
+    """
+    bridge = enable_comm_bridge(display=False)
+    intercept_localhost(4444, display=False)
+    assert 4444 in bridge.intercepted_ports
+
+
+def test_intercept_localhost_skips_redundant_display_when_trait_handled() -> None:
+    """
+    When the bridge is enabled, ``display=True`` must NOT emit the
+    inline ``<script>`` output (the trait path already covers it).
+    Avoids cluttering cells that construct many tile layers.
+    """
+    enable_comm_bridge(display=False)
+    captured: list[object] = []
+    # Patch IPython.display.display to observe what gets rendered.
+    with patch.object(comm_module, "_ipython_display", captured.append):
+        intercept_localhost(5555)
+    assert captured == []
+
+
+def test_intercept_localhost_displays_script_when_bridge_absent() -> None:
+    """
+    Without a live bridge singleton, ``intercept_localhost`` falls back
+    to the inline ``<script>`` shim and auto-displays it under
+    ``display=True``.
+    """
+    captured: list[object] = []
+    with patch.object(comm_module, "_ipython_display", captured.append):
+        intercept_localhost(6666)
+    assert len(captured) == 1
+    body = getattr(captured[0], "data", "")
+    assert "6666" in body

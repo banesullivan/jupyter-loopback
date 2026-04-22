@@ -30,27 +30,28 @@ import pathlib
 import threading
 from typing import Any
 
-# ``anywidget`` / ``IPython`` are optional runtime deps. Declaring them
-# as ``Any | None`` at module scope lets the rest of the file reassign
-# ``None`` in the ImportError branch without mypy complaining that
-# we're shadowing a Module type.
-anywidget: Any | None = None
-_ipython_display: Any | None = None
-
+# ``anywidget`` / ``IPython.display`` are optional runtime deps. Each
+# try/except below leaves the name bound to either the imported module
+# (happy path) or ``None`` (missing install). The ``type: ignore`` on
+# the None branch is the standard mypy-strict escape for this
+# optional-dependency pattern: mypy otherwise flags the ``None`` as
+# incompatible with the ``ModuleType`` inferred from the successful
+# import.
 try:
     import anywidget
 except ImportError:  # pragma: no cover - optional dependency
-    pass
+    anywidget = None  # type: ignore[assignment]
 
 try:
     from IPython.display import display as _ipython_display
 except ImportError:  # pragma: no cover - optional dependency
-    pass
+    _ipython_display = None  # type: ignore[assignment]
 
 __all__ = [
     "CommBridge",
     "RequestHandler",
     "enable_comm_bridge",
+    "intercept_localhost",
     "is_comm_bridge_enabled",
     "off_request",
     "on_request",
@@ -123,6 +124,13 @@ def on_request(namespace: str, kind: str) -> Callable[[RequestHandler], RequestH
         A decorator that returns the handler unchanged.
     """
 
+    if namespace == "__loopback__":
+        msg = (
+            "jupyter_loopback: the '__loopback__' namespace is reserved for "
+            "built-in fetch / ws_* kinds. Use a library-specific namespace."
+        )
+        raise ValueError(msg)
+
     def wrap(fn: RequestHandler) -> RequestHandler:
         with _HANDLER_LOCK:
             _HANDLERS[(namespace, kind)] = fn
@@ -189,8 +197,9 @@ if anywidget is None:
             raise ImportError(msg)
 
 else:
+    import traitlets
 
-    class CommBridge(anywidget.AnyWidget):  # type: ignore[no-redef,misc,name-defined]
+    class CommBridge(anywidget.AnyWidget):  # type: ignore[no-redef]
         """
         Singleton comm bridge exposed to the browser as ``window.__jupyter_loopback__``.
 
@@ -199,9 +208,27 @@ else:
 
         _esm = _WIDGET_ESM
 
+        # Ports the browser should reroute through this bridge. Synced
+        # so that every rendered view of the widget can call
+        # ``interceptLocalhost`` on its local ``window`` -- necessary in
+        # frontends where notebook outputs sit in separate iframes or
+        # where HTML ``<script>`` tags are sanitized (VS Code Jupyter).
+        intercepted_ports = traitlets.List(traitlets.Int()).tag(sync=True)
+
         def __init__(self, **kwargs: Any) -> None:
             super().__init__(**kwargs)
             self.on_msg(self._on_msg)
+
+        def add_intercepted_port(self, port: int) -> None:
+            """
+            Register a port so every rendered view intercepts its URLs.
+            """
+            port_int = int(port)
+            if port_int in self.intercepted_ports:
+                return
+            # Traitlets only fires ``change`` on identity change for
+            # List; mutate via new-list assignment.
+            self.intercepted_ports = [*self.intercepted_ports, port_int]
 
         def _on_msg(
             self,
@@ -264,18 +291,136 @@ def enable_comm_bridge(*, display: bool = True) -> "CommBridge":
             "Install with: pip install jupyter-loopback[comm]"
         )
         raise ImportError(msg)
+    # Import lazily so ``anywidget``-less installs can still import
+    # ``jupyter_loopback._comm`` to raise the nice ImportError above.
+    from jupyter_loopback import _bridge_proxy
+
     with _BRIDGE_LOCK:
         if _BRIDGE is None:
             _BRIDGE = CommBridge()
+        _bridge_proxy.install()
         _ENABLED = True
         bridge = _BRIDGE
     if display and _ipython_display is not None:
         # IPython.display.display raises when no frontend is attached
         # (e.g. a plain Python script calling enable for a test). The
         # bridge is still valid and whoever later displays it will boot
-        # the JS side, so swallow the error.
+        # the JS side, so swallow the error. ``IPython`` has no stubs,
+        # so the call looks ``Untyped`` to mypy under strict mode.
         try:
-            _ipython_display(bridge)
+            _ipython_display(bridge)  # type: ignore[no-untyped-call]
         except RuntimeError:
             pass
     return bridge
+
+
+def intercept_localhost(port: int, *, display: bool = True) -> Any:
+    """
+    Route ``http://127.0.0.1:<port>/*`` URLs through the comm bridge.
+
+    Many libraries (notably ``ipyleaflet``) build loopback URLs and hand
+    them to the browser as ``<img src>`` / ``fetch()`` / ``XMLHttpRequest``
+    calls that jupyter-loopback never sees directly. In jupyter-server
+    environments those URLs hit the HTTP proxy handler; in VS Code
+    Jupyter (and other webview-based frontends) they fail outright
+    because the webview origin isn't the jupyter-server origin.
+
+    This function emits a small JS shim that patches the three entry
+    points above so URLs matching the given loopback ``port`` are
+    rerouted through the already-enabled comm bridge. The rewrite is
+    idempotent per port and additive across ports, so a notebook that
+    spins up multiple ``TileClient`` instances can call this once per
+    client.
+
+    Requires :func:`enable_comm_bridge` to have been called earlier in
+    the same kernel; without it, the browser half of the bridge is not
+    installed and the shim is a no-op.
+
+    Parameters
+    ----------
+    port : int
+        The loopback port whose URLs should be intercepted.
+    display : bool, keyword-only, optional
+        If ``True`` (default), ``IPython.display.display`` the HTML
+        snippet so the shim installs immediately in the current
+        notebook. Pass ``False`` to get the ``HTML`` value back for
+        manual placement.
+
+    Returns
+    -------
+    IPython.display.HTML
+        The HTML object that was displayed (or would be, when
+        ``display=False``). Useful when composing richer cell outputs.
+
+    Raises
+    ------
+    ImportError
+        If ``IPython`` is not available.
+
+    Examples
+    --------
+    Typical use next to a localtileserver ``TileClient``::
+
+        import jupyter_loopback
+        jupyter_loopback.enable_comm_bridge()
+
+        from localtileserver import TileClient
+        client = TileClient("path/to/raster.tif")
+        jupyter_loopback.intercept_localhost(client.server_port)
+    """
+    try:
+        from IPython.display import HTML
+    except ImportError as exc:  # pragma: no cover - optional dep
+        msg = (
+            "jupyter_loopback.intercept_localhost requires IPython. "
+            "Install IPython or call the JS directly: "
+            "window.__jupyter_loopback__.interceptLocalhost(<port>)"
+        )
+        raise ImportError(msg) from exc
+
+    port_int = int(port)
+
+    # Primary install path: update the bridge's synced ``intercepted_ports``
+    # trait so every rendered widget view (regardless of iframe) receives
+    # the change and calls ``interceptLocalhost`` in its own
+    # ``HTMLImageElement.prototype`` context. This survives VS Code's
+    # <script>-tag sanitization in HTML outputs.
+    trait_handled = False
+    if _BRIDGE is not None:
+        try:
+            _BRIDGE.add_intercepted_port(port_int)  # type: ignore[attr-defined]
+            trait_handled = True
+        except Exception:
+            # Best-effort: if the trait update fails (e.g. stale bridge
+            # after a serialization weirdness), fall through to the HTML
+            # script. Debug-log rather than swallow silently.
+            logger.debug(
+                "jupyter_loopback: add_intercepted_port failed, falling back to <script>",
+                exc_info=True,
+            )
+
+    # Fallback install path: an inline <script> that polls briefly for
+    # the global. Still returned always so callers can embed it manually
+    # in custom HTML outputs; only auto-displayed when the trait path
+    # isn't available, otherwise we'd emit a redundant <script> output
+    # per call and clutter notebooks that construct many tile layers.
+    script = (
+        "<script>(function(){"
+        f"var p={port_int};"
+        "function g(){return window.__jupyter_loopback__;}"
+        "function go(){"
+        "var a=g();"
+        "if(a&&a.interceptLocalhost){a.interceptLocalhost(p);return true}"
+        "return false}"
+        "if(!go()){"
+        "var n=0;"
+        "var t=setInterval(function(){if(go()||++n>50)clearInterval(t)},100)}"
+        "})();</script>"
+    )
+    html = HTML(script)  # type: ignore[no-untyped-call]
+    if display and not trait_handled and _ipython_display is not None:
+        try:
+            _ipython_display(html)  # type: ignore[no-untyped-call]
+        except RuntimeError:
+            pass
+    return html
