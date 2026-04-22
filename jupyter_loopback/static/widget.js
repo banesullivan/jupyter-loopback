@@ -604,11 +604,24 @@ function ensureGlobal() {
                 continue;
             }
             const status = prefixStatus.get(prefix);
-            if (status === "working") return null;
-            // "probing" or "broken" (or unknown, e.g. probe errored
-            // before a fetch arrived) → route through comm. Rest is
-            // whatever the URL had after the prefix; preserve leading
-            // slash when present for the upstream request.
+            // "working" → HTTP proxy is live, leave it to direct fetch.
+            // "probing" → probe is still in flight; the page came from
+            // this origin so the proxy is overwhelmingly likely to
+            // answer directly. Optimistically pass through and let the
+            // browser's own HTTP request handle it. Routing through
+            // comm here loses early tiles on the first plot in a
+            // session because the comm bridge hasn't warmed up yet,
+            // and those failed requests never retry on their own.
+            // When the probe ultimately returns "broken", later tile
+            // URLs will be caught below and routed through comm; the
+            // handful of early ones that missed the switch are no
+            // worse off than they were before this change (they'd
+            // have timed out against a cold bridge anyway).
+            if (status === "working" || status === "probing") return null;
+            // "broken" (or unknown, e.g. probe errored before a fetch
+            // arrived) → route through comm. Rest is whatever the URL
+            // had after the prefix; preserve leading slash when
+            // present for the upstream request.
             const rest = parsed.pathname.slice(prefix.length) + parsed.search;
             return {
                 port,
