@@ -543,8 +543,10 @@ function ensureGlobal() {
     const prefixToPort = new Map();
     /**
      * Per-prefix probe outcome. Values:
-     *   "probing"  -- probe in flight; intercept now so early tiles
-     *                 don't 404 while we're waiting for the answer.
+     *   "probing"  -- probe in flight; interceptors must await
+     *                 :data:`prefixReady` before deciding how to
+     *                 route, otherwise the guess is wrong on one of
+     *                 Hub / mybinder.
      *   "working"  -- probe confirmed the HTTP proxy is mounted;
      *                 don't intercept, let the fast Path A handle it.
      *   "broken"   -- probe returned 404; comm bridge takes over.
@@ -552,6 +554,24 @@ function ensureGlobal() {
      * @type {Map<string, "probing" | "working" | "broken">}
      */
     const prefixStatus = new Map();
+    /**
+     * Per-prefix settlement signal. Keyed by the same normalized
+     * prefix as :data:`prefixStatus`; the Promise resolves (never
+     * rejects) when the probe's ``then``/``catch`` has flipped the
+     * status to ``"working"`` or ``"broken"``. Interceptors that land
+     * on a ``"probing"`` match defer their routing decision by
+     * awaiting this instead of guessing, which is what lets us
+     * satisfy both deployment shapes at once: JupyterHub (probe → 404
+     * → route through comm) and Lab / mybinder (probe → 204 → pass
+     * through to direct HTTP). Optimistic pass-through during probing
+     * silently 404s on Hub; pessimistic comm-route during probing
+     * times out on mybinder when the comm bridge isn't warm yet. The
+     * probe latency is far shorter than either failure window, so
+     * waiting is strictly better than guessing.
+     *
+     * @type {Map<string, Promise<void>>}
+     */
+    const prefixReady = new Map();
     /**
      * Original ``window.fetch`` captured before we patch it, so the
      * probe can reach the jupyter-server without our own interceptor
@@ -563,14 +583,31 @@ function ensureGlobal() {
     let interceptorInstalled = false;
 
     /**
-     * Return true if ``url`` targets an intercepted 127.0.0.1 / localhost
-     * port or a registered same-origin path prefix whose HTTP probe has
-     * not reported the proxy as working. Non-string inputs and URLs
-     * missing both a match shape are treated as no match so the
-     * interceptors leave them alone.
+     * Classify a URL against the registered loopback ports and same-origin
+     * prefixes. Returns ``null`` for URLs the interceptors should leave
+     * alone. Returns a shape carrying the loopback ``port`` / rewritten
+     * ``pathAndQuery`` plus a ``status`` that tells the caller how to
+     * route:
+     *
+     * - ``"working"``: the HTTP proxy is confirmed live; the caller
+     *   should still pass through to direct HTTP (interception is a
+     *   no-op). This shape exists so the caller can distinguish
+     *   "matches an intercepted prefix but probe said HTTP works" from
+     *   "URL doesn't match at all", which matters for XHR where we
+     *   otherwise would have short-circuited to ``origOpen`` before
+     *   knowing the probe outcome.
+     * - ``"broken"``: route through the comm bridge.
+     * - ``"probing"``: probe result isn't in yet; caller must await
+     *   :data:`prefixReady` and re-ask before routing. Guessing here
+     *   silently breaks one of Hub / mybinder.
+     *
+     * 127.0.0.1 / localhost matches always return ``"broken"`` because
+     * the frontend can't reach those ports directly -- the whole
+     * reason those ports are in :data:`interceptedPorts` is that comm
+     * is the only route that works.
      *
      * @param {unknown} url
-     * @returns {{ port: number, pathAndQuery: string } | null}
+     * @returns {{ port: number, pathAndQuery: string, prefix: string | null, status: "probing" | "working" | "broken" } | null}
      */
     function interceptMatch(url) {
         if (typeof url !== "string" || url.length === 0) return null;
@@ -591,6 +628,8 @@ function ensureGlobal() {
             return {
                 port: Number(parsed.port),
                 pathAndQuery: parsed.pathname + parsed.search,
+                prefix: null,
+                status: "broken",
             };
         }
         // Same-origin prefix match — only relevant if the URL lives on
@@ -603,29 +642,14 @@ function ensureGlobal() {
             if (parsed.pathname !== prefix && !parsed.pathname.startsWith(`${prefix}/`)) {
                 continue;
             }
-            const status = prefixStatus.get(prefix);
-            // "working" → HTTP proxy is live, leave it to direct fetch.
-            // "probing" → probe is still in flight; the page came from
-            // this origin so the proxy is overwhelmingly likely to
-            // answer directly. Optimistically pass through and let the
-            // browser's own HTTP request handle it. Routing through
-            // comm here loses early tiles on the first plot in a
-            // session because the comm bridge hasn't warmed up yet,
-            // and those failed requests never retry on their own.
-            // When the probe ultimately returns "broken", later tile
-            // URLs will be caught below and routed through comm; the
-            // handful of early ones that missed the switch are no
-            // worse off than they were before this change (they'd
-            // have timed out against a cold bridge anyway).
-            if (status === "working" || status === "probing") return null;
-            // "broken" (or unknown, e.g. probe errored before a fetch
-            // arrived) → route through comm. Rest is whatever the URL
-            // had after the prefix; preserve leading slash when
-            // present for the upstream request.
+            /** @type {"probing" | "working" | "broken"} */
+            const status = prefixStatus.get(prefix) || "broken";
             const rest = parsed.pathname.slice(prefix.length) + parsed.search;
             return {
                 port,
                 pathAndQuery: rest || "/",
+                prefix,
+                status,
             };
         }
         return null;
@@ -647,11 +671,20 @@ function ensureGlobal() {
     function probePrefix(prefix) {
         if (prefixStatus.has(prefix)) return;
         prefixStatus.set(prefix, "probing");
+        /** @type {(value?: void) => void} */
+        let markReady = () => {};
+        const ready = /** @type {Promise<void>} */ (
+            new Promise((resolveReady) => {
+                markReady = resolveReady;
+            })
+        );
+        prefixReady.set(prefix, ready);
         const fetcher = origFetch || (typeof fetch === "function" ? fetch : null);
         if (!fetcher) {
             // No fetch at all (exotic host): treat as broken so the
             // comm bridge still has a shot via XHR / <img> interceptors.
             prefixStatus.set(prefix, "broken");
+            markReady();
             return;
         }
         // ``__probe__`` is reserved by ``setup_proxy_handler`` and
@@ -681,6 +714,7 @@ function ensureGlobal() {
                 } catch (_) {
                     /* console may be absent */
                 }
+                markReady();
             })
             .catch((err) => {
                 // Network failures (CORS, offline, etc.) mean we can't
@@ -698,6 +732,7 @@ function ensureGlobal() {
                 } catch (_) {
                     /* console may be absent */
                 }
+                markReady();
             });
     }
 
@@ -713,6 +748,34 @@ function ensureGlobal() {
             if (desc?.set && desc.get) {
                 const origSet = desc.set;
                 const origGet = desc.get;
+                /**
+                 * @param {HTMLImageElement} imgEl
+                 * @param {{ port: number, pathAndQuery: string }} decided
+                 * @param {string} origValue
+                 */
+                function routeImgThroughComm(imgEl, decided, origValue) {
+                    try {
+                        console.debug(
+                            "[jupyter_loopback] intercept img.src",
+                            origValue,
+                            "-> comm bridge",
+                        );
+                    } catch (_) {
+                        /* console may be absent */
+                    }
+                    resolveUrl(decided.port, decided.pathAndQuery)
+                        .then((blobUrl) => {
+                            origSet.call(imgEl, blobUrl);
+                        })
+                        .catch((err) => {
+                            // eslint-disable-next-line no-console
+                            console.error(
+                                "jupyter_loopback.interceptLocalhost: image fetch failed",
+                                err,
+                            );
+                            imgEl.dispatchEvent(new Event("error"));
+                        });
+                }
                 Object.defineProperty(proto, "src", {
                     configurable: true,
                     get() {
@@ -720,31 +783,25 @@ function ensureGlobal() {
                     },
                     set(value) {
                         const match = interceptMatch(value);
-                        if (!match) {
+                        if (!match || match.status === "working") {
                             origSet.call(this, value);
                             return;
                         }
-                        try {
-                            console.debug(
-                                "[jupyter_loopback] intercept img.src",
-                                value,
-                                "-> comm bridge",
-                            );
-                        } catch (_) {
-                            /* console may be absent */
+                        if (match.status === "probing" && match.prefix) {
+                            const ready = prefixReady.get(match.prefix);
+                            if (ready) {
+                                ready.then(() => {
+                                    const decided = interceptMatch(value);
+                                    if (!decided || decided.status === "working") {
+                                        origSet.call(this, value);
+                                    } else {
+                                        routeImgThroughComm(this, decided, value);
+                                    }
+                                });
+                                return;
+                            }
                         }
-                        resolveUrl(match.port, match.pathAndQuery)
-                            .then((blobUrl) => {
-                                origSet.call(this, blobUrl);
-                            })
-                            .catch((err) => {
-                                // eslint-disable-next-line no-console
-                                console.error(
-                                    "jupyter_loopback.interceptLocalhost: image fetch failed",
-                                    err,
-                                );
-                                this.dispatchEvent(new Event("error"));
-                            });
+                        routeImgThroughComm(this, match, value);
                     },
                 });
             }
@@ -765,7 +822,21 @@ function ensureGlobal() {
                     return /** @type {typeof fetch} */ (origFetch)(input, init);
                 }
                 const match = interceptMatch(url);
-                if (!match) return /** @type {typeof fetch} */ (origFetch)(input, init);
+                if (!match || match.status === "working") {
+                    return /** @type {typeof fetch} */ (origFetch)(input, init);
+                }
+                if (match.status === "probing" && match.prefix) {
+                    const ready = prefixReady.get(match.prefix);
+                    if (ready) {
+                        return ready.then(() => {
+                            const decided = interceptMatch(url);
+                            if (!decided || decided.status === "working") {
+                                return /** @type {typeof fetch} */ (origFetch)(input, init);
+                            }
+                            return loopbackFetch(decided.port, decided.pathAndQuery, init);
+                        });
+                    }
+                }
                 return loopbackFetch(match.port, match.pathAndQuery, init);
             };
         }
@@ -778,7 +849,7 @@ function ensureGlobal() {
              * Per-XHR metadata stashed in a WeakMap so we don't have to
              * pollute the XMLHttpRequest instance with custom fields
              * (which TypeScript's built-in lib.dom types reject).
-             * @type {WeakMap<XMLHttpRequest, { match: { port: number, pathAndQuery: string }, method: string }>}
+             * @type {WeakMap<XMLHttpRequest, { match: NonNullable<ReturnType<typeof interceptMatch>>, method: string }>}
              */
             const xhrMeta = new WeakMap();
 
@@ -794,11 +865,20 @@ function ensureGlobal() {
                 const url = args[1];
                 const u = typeof url === "string" ? url : (url?.href ?? "");
                 const match = interceptMatch(u);
-                if (match) {
-                    xhrMeta.set(this, { match, method: String(method || "GET") });
-                    return;
+                // XHR can't defer its decision the way ``img.src`` and
+                // ``fetch`` can: callers are allowed to call
+                // :meth:`setRequestHeader` between ``open`` and
+                // ``send``, which only works once the XHR is in
+                // ``OPENED`` state. So we collapse the decision to two
+                // buckets and bias ``"probing"`` to comm (the correct
+                // answer on Hub, a small perf detour on Lab). In
+                // practice tile libraries drive ``<img>`` rather than
+                // XHR, so this barely matters.
+                if (!match || match.status === "working") {
+                    return /** @type {any} */ (origOpen).apply(this, args);
                 }
-                return /** @type {any} */ (origOpen).apply(this, args);
+                xhrMeta.set(this, { match, method: String(method || "GET") });
+                return;
             };
 
             /** @this {XMLHttpRequest} */

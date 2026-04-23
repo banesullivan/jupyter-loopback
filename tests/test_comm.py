@@ -353,20 +353,26 @@ def test_widget_js_wires_prefix_interception_and_probe() -> None:
     assert "probePrefix" in contents
 
 
-def test_widget_js_passes_through_same_origin_urls_while_probing() -> None:
+def test_widget_js_defers_routing_while_probing() -> None:
     """
-    Regression guard for the first-plot race: while the probe is in
-    flight, same-origin prefix URLs must pass through to direct HTTP,
-    not route through a (likely cold) comm bridge. Dropping the
-    ``"probing"`` branch here reintroduces the symptom where the first
-    tile layer rendered in a session times out instead of loading.
+    Regression guard for the first-plot races on both supported
+    deployment shapes. The bundle must neither bias probing → HTTP
+    (silently 404s on JupyterHub when the single-user server lacks
+    the extension) nor bias probing → comm (times out on mybinder
+    when the comm bridge hasn't warmed up yet). It must wait for the
+    probe to settle, then re-ask before routing.
     """
     contents = Path(comm_module._WIDGET_ESM).read_text()
-    # Both "working" and "probing" must short-circuit the same way. We
-    # assert on the combined conditional rather than the individual
-    # strings so a future refactor that splits them still has to keep
-    # both as "pass through" to make this test pass.
-    assert 'status === "working" || status === "probing"' in contents
+    # The probe-completion signal must exist so img/fetch interceptors
+    # can await it before deciding.
+    assert "prefixReady" in contents
+    # The "working" short-circuit stays -- that's the fast path for
+    # post-probe direct HTTP fetches on Lab / mybinder.
+    assert 'status === "working"' in contents
+    # But probing must NOT be collapsed into the same short-circuit
+    # (that's the Hub-breaking bias) or into an unconditional comm
+    # route (that's the mybinder-breaking bias).
+    assert 'status === "working" || status === "probing"' not in contents
 
 
 def test_widget_js_binds_intercepted_prefixes_trait() -> None:
