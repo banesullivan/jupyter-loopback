@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "loopback-demo"
 version = "0.1.0"
-description = "jupyter-loopback integration reference + example notebook."
+description = "jupyter-loopback integration reference + example notebooks."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -17,13 +17,20 @@ dependencies = [
   "requests",
 ]
 
+[project.optional-dependencies]
+# Pulled in by the Dockerfile so the PyVista trame demo notebook works.
+# Kept optional so the basic loopback-demo doesn't drag in VTK on systems
+# that only need the HTTP/WS proxy reference integration.
+pyvista = ["pyvista[jupyter]"]
+
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["loopback_demo*"]
+include = ["loopback_demo*", "pyvista_loopback_demo*"]
 
 [tool.setuptools.data-files]
 "etc/jupyter/jupyter_server_config.d" = [
   "jupyter-config/jupyter_server_config.d/loopback-demo.json",
+  "jupyter-config/jupyter_server_config.d/pyvista-loopback-demo.json",
 ]
