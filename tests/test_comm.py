@@ -384,3 +384,30 @@ def test_widget_js_binds_intercepted_prefixes_trait() -> None:
     contents = Path(comm_module._WIDGET_ESM).read_text()
     assert "intercepted_prefixes" in contents
     assert "change:intercepted_prefixes" in contents
+
+
+def test_widget_js_probe_requires_2xx() -> None:
+    """
+    Regression guard: the probe must only trust a 2xx answer as proof
+    the proxy extension is mounted (it responds 204 to
+    ``HEAD <prefix>/__probe__``). Servers without the extension don't
+    always answer 404 -- standalone voila replies 405 to HEAD and
+    302-redirects GETs to its file handler -- and classifying those as
+    "working" routes every request to a dead HTTP path.
+    """
+    contents = Path(comm_module._WIDGET_ESM).read_text()
+    assert 'resp.ok ? "working" : "broken"' in contents
+    assert 'resp.status === 404 ? "broken"' not in contents
+
+
+def test_widget_js_localhost_page_origin_reaches_prefix_match() -> None:
+    """
+    Regression guard: when the page itself is served from
+    127.0.0.1/localhost (e.g. standalone voila), same-origin prefix
+    URLs parse as localhost too. The localhost branch must only
+    short-circuit for *registered* loopback ports and otherwise fall
+    through, so those URLs still reach the prefix matching.
+    """
+    contents = Path(comm_module._WIDGET_ESM).read_text()
+    assert "parsed.port && interceptedPorts.has(parsed.port)" in contents
+    assert "if (!interceptedPorts.has(parsed.port)) return null;" not in contents

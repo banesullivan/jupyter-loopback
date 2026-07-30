@@ -622,15 +622,20 @@ function ensureGlobal() {
         // 127.0.0.1 / localhost — the path for frontends that can't
         // reach jupyter-server (VS Code webview, Colab, etc.) or for
         // bare TileClient users who never wired up a proxy prefix.
+        // Only a *registered* loopback port short-circuits here: when
+        // the page itself is served from localhost (e.g. standalone
+        // voila on 127.0.0.1), same-origin prefix URLs also parse as
+        // localhost and must fall through to the prefix matching
+        // below instead of being dismissed.
         if (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost") {
-            if (!parsed.port) return null;
-            if (!interceptedPorts.has(parsed.port)) return null;
-            return {
-                port: Number(parsed.port),
-                pathAndQuery: parsed.pathname + parsed.search,
-                prefix: null,
-                status: "broken",
-            };
+            if (parsed.port && interceptedPorts.has(parsed.port)) {
+                return {
+                    port: Number(parsed.port),
+                    pathAndQuery: parsed.pathname + parsed.search,
+                    prefix: null,
+                    status: "broken",
+                };
+            }
         }
         // Same-origin prefix match — only relevant if the URL lives on
         // the jupyter-server origin that served this page. Cross-origin
@@ -699,7 +704,13 @@ function ensureGlobal() {
         });
         probe
             .then((resp) => {
-                const status = resp.status === 404 ? "broken" : "working";
+                // Only a 2xx answer proves the proxy extension is
+                // mounted (it responds 204 to HEAD <prefix>/__probe__).
+                // Servers without the extension can answer with things
+                // other than 404 — standalone voila replies 405 to HEAD
+                // and 302-redirects GETs — and treating those as
+                // "working" sends every request to a dead HTTP path.
+                const status = resp.ok ? "working" : "broken";
                 prefixStatus.set(prefix, status);
                 try {
                     console.info(
